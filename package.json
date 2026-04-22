@@ -1,14 +1,14 @@
 {
   "name": "@openclaw/lai",
   "version": "2026.4.20",
-  "description": "OpenClaw lai runtime slash command plugin",
+  "description": "OpenClaw lai marketplace bridge package",
   "type": "module",
   "devDependencies": {
     "@openclaw/plugin-sdk": "workspace:*"
   },
   "openclaw": {
     "extensions": [
-      "./index.ts"
+      "./plugins/lai/index.ts"
     ]
   }
 }

@@ -1,0 +1,17 @@
+{
+  "id": "lai",
+  "name": "LAI",
+  "description": "Run the local lai CLI directly as a runtime slash command.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  },
+  "commandAliases": [
+    {
+      "name": "lai",
+      "kind": "runtime-slash",
+      "cliCommand": "plugins"
+    }
+  ]
+}

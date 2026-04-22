@@ -1,6 +1,8 @@
-# @openclaw/lai
+# OpenClaw LAI Plugin
 
-OpenClaw plugin that runs the local `lai` CLI directly as a runtime slash command.
+This directory is an OpenClaw plugin marketplace containing the `lai` plugin.
+
+The actual plugin package lives under `plugins/lai`.
 
 ## Install
 
@@ -9,6 +11,18 @@ openclaw plugins install lai --marketplace https://github.com/chana1024/openclaw
 ```
 
 Restart the Gateway after install.
+
+For local development, you can install from the local marketplace root:
+
+```bash
+openclaw plugins install lai --marketplace /path/to/openclaw-lai-plugin --dangerously-force-unsafe-install
+```
+
+Or link the plugin package directly:
+
+```bash
+openclaw plugins install -l /path/to/openclaw-lai-plugin/plugins/lai --dangerously-force-unsafe-install
+```
 
 ## Usage
 

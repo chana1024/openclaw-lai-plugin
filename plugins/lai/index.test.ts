@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import { describe, expect, it, vi } from "vitest";
-import { createTestPluginApi } from "../../test/helpers/plugins/plugin-api.js";
+import { createTestPluginApi } from "../../../../test/helpers/plugins/plugin-api.js";
 import plugin from "./index.js";
 
 describe("lai plugin", () => {
