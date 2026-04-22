@@ -1,0 +1,12 @@
+{
+  "name": "chana1024-openclaw-plugins",
+  "version": "2026.4.20",
+  "plugins": [
+    {
+      "name": "lai",
+      "version": "2026.4.20",
+      "description": "Run the local lai CLI directly as an OpenClaw runtime slash command.",
+      "source": "./plugins/lai"
+    }
+  ]
+}
