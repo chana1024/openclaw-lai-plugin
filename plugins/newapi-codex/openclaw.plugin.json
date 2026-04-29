@@ -1,0 +1,26 @@
+{
+  "id": "newapi-codex",
+  "name": "New API Codex Provider",
+  "description": "Routes Codex-style OpenAI Responses requests to a local new-api endpoint.",
+  "providers": [
+    "newapi-codex"
+  ],
+  "providerAuthEnvVars": {
+    "newapi-codex": [
+      "NEWAPI_CODEX_API_KEY"
+    ]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "baseUrl": {
+        "type": "string",
+        "default": "http://127.0.0.1:3000/v1"
+      },
+      "apiKey": {
+        "type": "string"
+      }
+    }
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "name": "@chana1024/newapi-codex",
+  "version": "2026.4.29",
+  "description": "OpenClaw provider plugin for new-api Codex Responses endpoints",
+  "type": "module",
+  "main": "index.ts",
+  "openclaw": {
+    "extensions": ["./index.ts"],
+    "compat": {
+      "pluginApi": ">=2026.4.15",
+      "minGatewayVersion": "2026.4.15"
+    },
+    "build": {
+      "openclawVersion": "2026.4.15",
+      "pluginSdkVersion": "2026.4.15"
+    }
+  }
+}

@@ -1,12 +1,18 @@
 {
   "name": "chana1024-openclaw-plugins",
-  "version": "2026.4.20",
+  "version": "2026.4.29",
   "plugins": [
     {
       "name": "lai",
       "version": "2026.4.20",
       "description": "Run the local lai CLI directly as an OpenClaw runtime slash command.",
       "source": "./plugins/lai"
+    },
+    {
+      "name": "newapi-codex",
+      "version": "2026.4.29",
+      "description": "Route OpenClaw Codex model calls to a local new-api /v1/responses endpoint.",
+      "source": "./plugins/newapi-codex"
     }
   ]
 }
