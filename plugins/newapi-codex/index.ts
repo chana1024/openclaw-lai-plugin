@@ -4,10 +4,22 @@ const PROVIDER_ID = "newapi-codex";
 const API_ID = "openai-codex-responses";
 const DEFAULT_BASE_URL = "http://127.0.0.1:3000/v1";
 const MODEL_IDS = ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex"];
+const XHIGH_MODEL_IDS = new Set(["gpt-5.5", "gpt-5.4", "gpt-5.3-codex"]);
+const MODERN_MODEL_IDS = new Set(MODEL_IDS);
 
 type AnyRecord = Record<string, any>;
 
-class AssistantStream implements AsyncIterable<AnyRecord> {
+const openClawPluginEntryUrl = import.meta.resolve("openclaw/plugin-sdk/plugin-entry");
+const openAIResponsesSharedUrl = new URL(
+  "../../node_modules/@mariozechner/pi-ai/dist/providers/openai-responses-shared.js",
+  openClawPluginEntryUrl,
+).href;
+const MAX_RETRIES = 3;
+const BASE_DELAY_MS = 1000;
+const CODEX_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
+const CODEX_RESPONSE_STATUSES = new Set(["completed", "incomplete", "failed", "cancelled", "queued", "in_progress"]);
+
+class ForwardingStream implements AsyncIterable<AnyRecord> {
   private queue: AnyRecord[] = [];
   private waiters: Array<(value: IteratorResult<AnyRecord>) => void> = [];
   private done = false;
@@ -60,261 +72,83 @@ function normalizeBaseUrl(raw: unknown): string {
   return value.replace(/\/+$/, "");
 }
 
-function resolveApiKey(model: AnyRecord, options: AnyRecord | undefined, pluginConfig: AnyRecord): string {
-  const value = options?.apiKey ?? model.apiKey ?? pluginConfig.apiKey;
+function resolveApiKey(pluginConfig: AnyRecord, apiKey?: string): string {
+  const value = apiKey ?? pluginConfig.apiKey ?? process.env.NEWAPI_CODEX_API_KEY;
   return typeof value === "string" ? value.trim() : "";
 }
 
-function createOutput(model: AnyRecord): AnyRecord {
-  return {
-    role: "assistant",
-    content: [],
-    api: API_ID,
-    provider: model.provider,
-    model: model.id,
-    usage: {
-      input: 0,
-      output: 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-      totalTokens: 0,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-    },
-    stopReason: "stop",
-    timestamp: Date.now(),
-  };
-}
-
-function textOfContent(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  return content
-    .map((item) => {
-      if (!item || typeof item !== "object") return "";
-      const part = item as AnyRecord;
-      return part.type === "text" && typeof part.text === "string" ? part.text : "";
-    })
-    .filter(Boolean)
-    .join("\n");
-}
-
-function convertInput(model: AnyRecord, context: AnyRecord): AnyRecord[] {
-  const input: AnyRecord[] = [];
-  for (const message of context.messages ?? []) {
-    if (!message || typeof message !== "object") continue;
-    const msg = message as AnyRecord;
-    if (msg.role === "user") {
-      const content = Array.isArray(msg.content)
-        ? msg.content.flatMap((item: AnyRecord) => {
-            if (item?.type === "text" && typeof item.text === "string") {
-              return [{ type: "input_text", text: item.text }];
-            }
-            if (item?.type === "image" && model.input?.includes("image") && item.mimeType && item.data) {
-              return [{ type: "input_image", detail: "auto", image_url: `data:${item.mimeType};base64,${item.data}` }];
-            }
-            return [];
-          })
-        : [{ type: "input_text", text: String(msg.content ?? "") }];
-      if (content.length > 0) input.push({ role: "user", content });
-    } else if (msg.role === "assistant") {
-      for (const block of msg.content ?? []) {
-        if (block?.type === "text" && typeof block.text === "string") {
-          input.push({
-            type: "message",
-            role: "assistant",
-            content: [{ type: "output_text", text: block.text, annotations: [] }],
-            status: "completed",
-          });
-        } else if (block?.type === "toolCall") {
-          const [callId, itemId] = String(block.id ?? "").split("|");
-          input.push({
-            type: "function_call",
-            id: itemId || undefined,
-            call_id: callId || String(block.id ?? ""),
-            name: block.name,
-            arguments: JSON.stringify(block.arguments ?? {}),
-          });
-        }
-      }
-    } else if (msg.role === "toolResult") {
-      const [callId] = String(msg.toolCallId ?? "").split("|");
-      input.push({
-        type: "function_call_output",
-        call_id: callId || String(msg.toolCallId ?? ""),
-        output: textOfContent(msg.content),
-      });
+function sleep(ms: number, signal?: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error("Request was aborted"));
+      return;
     }
-  }
-  return input;
+    const timeout = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timeout);
+        reject(new Error("Request was aborted"));
+      },
+      { once: true },
+    );
+  });
 }
 
-function buildBody(model: AnyRecord, context: AnyRecord, options: AnyRecord | undefined): AnyRecord {
-  const body: AnyRecord = {
-    model: model.id,
-    store: false,
-    stream: true,
-    instructions: context.systemPrompt || "You are a helpful assistant.",
-    input: convertInput(model, context),
-    text: { verbosity: options?.textVerbosity || "medium" },
-    include: ["reasoning.encrypted_content"],
-    prompt_cache_key: options?.sessionId,
-    tool_choice: "auto",
-    parallel_tool_calls: true,
-  };
-  if (options?.temperature !== undefined) body.temperature = options.temperature;
-  if (options?.reasoning !== undefined) {
-    body.reasoning = { effort: options.reasoning === "minimal" ? "low" : options.reasoning, summary: "auto" };
-  }
-  if (Array.isArray(context.tools) && context.tools.length > 0) {
-    body.tools = context.tools.map((tool: AnyRecord) => ({
-      type: "function",
-      name: tool.name,
-      description: tool.description,
-      parameters: tool.parameters,
-      strict: null,
-    }));
-  }
-  return body;
+function isRetryableError(status: number, errorText: string): boolean {
+  if ([429, 500, 502, 503, 504].includes(status)) return true;
+  return /rate.?limit|overloaded|service.?unavailable|upstream.?connect|connection.?refused/i.test(errorText);
 }
 
-async function* parseSse(response: Response): AsyncGenerator<AnyRecord> {
-  const reader = response.body?.getReader();
-  if (!reader) return;
-  const decoder = new TextDecoder();
-  let buffer = "";
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    let index = buffer.indexOf("\n\n");
-    while (index !== -1) {
-      const chunk = buffer.slice(0, index);
-      buffer = buffer.slice(index + 2);
-      const data = chunk
-        .split("\n")
-        .filter((line) => line.startsWith("data:"))
-        .map((line) => line.slice(5).trim())
-        .join("\n")
-        .trim();
-      if (data && data !== "[DONE]") {
-        try {
-          yield JSON.parse(data);
-        } catch {
-          // Ignore malformed keepalive chunks.
-        }
-      }
-      index = buffer.indexOf("\n\n");
-    }
-  }
+function headersToRecord(headers: Headers): Record<string, string> {
+  const result: Record<string, string> = {};
+  headers.forEach((value, key) => {
+    result[key] = value;
+  });
+  return result;
 }
 
-async function parseError(response: Response): Promise<string> {
+async function parseErrorResponse(response: Response): Promise<string> {
   const raw = await response.text();
   try {
     const parsed = JSON.parse(raw);
-    return parsed?.error?.message || raw || response.statusText;
+    return parsed?.error?.message || parsed?.message || raw || response.statusText || "Request failed";
   } catch {
-    return raw || response.statusText;
+    return raw || response.statusText || "Request failed";
   }
 }
 
-function pushText(stream: AssistantStream, output: AnyRecord, text: string) {
-  if (!text) return;
-  let block = output.content[output.content.length - 1];
-  if (!block || block.type !== "text") {
-    block = { type: "text", text: "" };
-    output.content.push(block);
-    stream.push({ type: "text_start", contentIndex: output.content.length - 1, partial: output });
-  }
-  block.text += text;
-  stream.push({ type: "text_delta", contentIndex: output.content.length - 1, delta: text, partial: output });
+function buildModels(baseUrl: string) {
+  return MODEL_IDS.map((id) => ({
+    id,
+    name: `${id} (new-api Codex)`,
+    api: API_ID,
+    provider: PROVIDER_ID,
+    baseUrl,
+    reasoning: true,
+    input: ["text", "image"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: id === "gpt-5.4" ? 1050000 : 400000,
+    contextTokens: id === "gpt-5.4" ? 272000 : undefined,
+    maxTokens: 128000,
+  }));
 }
 
-function finishText(stream: AssistantStream, output: AnyRecord) {
-  const index = output.content.length - 1;
-  const block = output.content[index];
-  if (block?.type === "text") {
-    stream.push({ type: "text_end", contentIndex: index, content: block.text, partial: output });
-  }
-}
-
-function mapUsage(response: AnyRecord, output: AnyRecord) {
-  const usage = response?.usage;
-  if (!usage) return;
-  const cached = usage.input_tokens_details?.cached_tokens || 0;
-  output.usage.input = (usage.input_tokens || 0) - cached;
-  output.usage.output = usage.output_tokens || 0;
-  output.usage.cacheRead = cached;
-  output.usage.totalTokens = usage.total_tokens || output.usage.input + output.usage.output + cached;
-}
-
-function createStreamFn(pluginConfig: AnyRecord, runtimeContext?: AnyRecord) {
-  return (model: AnyRecord, context: AnyRecord, options?: AnyRecord) => {
-    const runtimeModel = runtimeContext?.model ?? {};
-    const effectiveModel = {
-      ...runtimeModel,
-      ...model,
-      id: model?.id ?? runtimeContext?.modelId ?? runtimeModel?.id ?? "gpt-5.4",
-      provider: model?.provider ?? runtimeContext?.provider ?? runtimeModel?.provider ?? PROVIDER_ID,
-      baseUrl: model?.baseUrl ?? runtimeModel?.baseUrl ?? pluginConfig.baseUrl,
-      apiKey: model?.apiKey ?? runtimeModel?.apiKey ?? pluginConfig.apiKey,
-    };
-    const stream = new AssistantStream();
-    const output = createOutput(effectiveModel);
-    queueMicrotask(async () => {
-      try {
-        const apiKey = resolveApiKey(effectiveModel, options, pluginConfig);
-        if (!apiKey) throw new Error("No API key for provider: newapi-codex");
-        const response = await fetch(`${normalizeBaseUrl(effectiveModel.baseUrl ?? pluginConfig.baseUrl)}/responses`, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${apiKey}`,
-            accept: "text/event-stream",
-            "content-type": "application/json",
-          },
-          body: JSON.stringify(buildBody(effectiveModel, context, options)),
-          signal: options?.signal,
-        });
-        if (!response.ok) throw new Error(await parseError(response));
-        stream.push({ type: "start", partial: output });
-        for await (const event of parseSse(response)) {
-          if (event.type === "response.created" && event.response?.id) output.responseId = event.response.id;
-          else if (event.type === "response.output_text.delta") pushText(stream, output, event.delta || "");
-          else if (event.type === "response.output_item.done" && event.item?.type === "message") {
-            const text = (event.item.content ?? []).map((part: AnyRecord) => part.text || part.refusal || "").join("");
-            const block = output.content[output.content.length - 1];
-            if (block?.type === "text" && text) block.text = text;
-            finishText(stream, output);
-          } else if (event.type === "response.completed") {
-            if (event.response?.id) output.responseId = event.response.id;
-            mapUsage(event.response, output);
-            output.stopReason = output.content.some((block: AnyRecord) => block.type === "toolCall") ? "toolUse" : "stop";
-          } else if (event.type === "response.failed") {
-            throw new Error(event.response?.error?.message || "new-api response failed");
-          } else if (event.type === "error") {
-            throw new Error(event.message || event.code || "new-api stream error");
-          }
-        }
-        stream.push({ type: "done", reason: output.stopReason, message: output });
-        stream.end();
-      } catch (error) {
-        output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-        output.errorMessage = error instanceof Error ? error.message : String(error);
-        stream.push({ type: "error", reason: output.stopReason, error: output });
-        stream.end();
-      }
-    });
-    return stream;
-  };
-}
-
-function buildProvider(config: AnyRecord, apiKey: string) {
+function buildProvider(config: AnyRecord, apiKey?: string) {
   const baseUrl = normalizeBaseUrl(config.baseUrl);
   return {
     baseUrl,
-    apiKey,
+    apiKey: resolveApiKey(config, apiKey),
     api: API_ID,
-    models: MODEL_IDS.map((id) => ({
+    models: buildModels(baseUrl),
+  };
+}
+
+function resolveDynamicModel(config: AnyRecord, modelId: string) {
+  const baseUrl = normalizeBaseUrl(config.baseUrl);
+  const id = modelId.trim() || "gpt-5.4";
+  return (
+    buildModels(baseUrl).find((model) => model.id === id) ?? {
       id,
       name: `${id} (new-api Codex)`,
       api: API_ID,
@@ -325,7 +159,229 @@ function buildProvider(config: AnyRecord, apiKey: string) {
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow: 400000,
       maxTokens: 128000,
-    })),
+    }
+  );
+}
+
+function resolveResponsesUrl(baseUrl: string): string {
+  const normalized = normalizeBaseUrl(baseUrl);
+  if (normalized.endsWith("/responses")) return normalized;
+  return `${normalized}/responses`;
+}
+
+function clampReasoningEffort(modelId: string, effort: string) {
+  const id = modelId.includes("/") ? modelId.split("/").pop()! : modelId;
+  if (
+    (id.startsWith("gpt-5.2") || id.startsWith("gpt-5.3") || id.startsWith("gpt-5.4") || id.startsWith("gpt-5.5")) &&
+    effort === "minimal"
+  ) {
+    return "low";
+  }
+  if (id === "gpt-5.1" && effort === "xhigh") return "high";
+  if (id === "gpt-5.1-codex-mini") return effort === "high" || effort === "xhigh" ? "high" : "medium";
+  return effort;
+}
+
+async function buildRequestBody(model: AnyRecord, context: AnyRecord, options: AnyRecord | undefined): Promise<AnyRecord> {
+  const { convertResponsesMessages, convertResponsesTools } = (await import(openAIResponsesSharedUrl)) as AnyRecord;
+  const messages = convertResponsesMessages(model, context, CODEX_TOOL_CALL_PROVIDERS, {
+    includeSystemPrompt: false,
+  });
+  const body: AnyRecord = {
+    model: model.id,
+    store: false,
+    stream: true,
+    instructions: context.systemPrompt,
+    input: messages,
+    text: { verbosity: options?.textVerbosity || "low" },
+    include: ["reasoning.encrypted_content"],
+    prompt_cache_key: options?.sessionId,
+    tool_choice: "auto",
+    parallel_tool_calls: true,
+  };
+  if (options?.maxTokens) body.max_output_tokens = options.maxTokens;
+  if (options?.temperature !== undefined) body.temperature = options.temperature;
+  if (options?.serviceTier !== undefined) body.service_tier = options.serviceTier;
+  if (context.tools && context.tools.length > 0) body.tools = convertResponsesTools(context.tools, { strict: null });
+  if (options?.reasoningEffort !== undefined) {
+    body.reasoning = {
+      effort: clampReasoningEffort(String(model.id), options.reasoningEffort),
+      summary: options.reasoningSummary ?? "auto",
+    };
+  }
+  return body;
+}
+
+async function* parseSSE(response: Response): AsyncGenerator<AnyRecord> {
+  if (!response.body) return;
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let idx = buffer.indexOf("\n\n");
+      while (idx !== -1) {
+        const chunk = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        const dataLines = chunk
+          .split("\n")
+          .filter((line) => line.startsWith("data:"))
+          .map((line) => line.slice(5).trim());
+        if (dataLines.length > 0) {
+          const data = dataLines.join("\n").trim();
+          if (data && data !== "[DONE]") {
+            try {
+              yield JSON.parse(data);
+            } catch {
+              // Ignore malformed SSE fragments; upstream stream errors are emitted as events.
+            }
+          }
+        }
+        idx = buffer.indexOf("\n\n");
+      }
+    }
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {}
+    try {
+      reader.releaseLock();
+    } catch {}
+  }
+}
+
+function normalizeCodexStatus(status: unknown) {
+  if (typeof status !== "string") return undefined;
+  return CODEX_RESPONSE_STATUSES.has(status) ? status : undefined;
+}
+
+async function* mapCodexEvents(events: AsyncIterable<AnyRecord>): AsyncGenerator<AnyRecord> {
+  for await (const event of events) {
+    const type = typeof event.type === "string" ? event.type : undefined;
+    if (!type) continue;
+    if (type === "error") {
+      const code = event.code || "";
+      const message = event.message || "";
+      throw new Error(`Codex error: ${message || code || JSON.stringify(event)}`);
+    }
+    if (type === "response.failed") {
+      const msg = event.response?.error?.message;
+      throw new Error(msg || "Codex response failed");
+    }
+    if (type === "response.done" || type === "response.completed" || type === "response.incomplete") {
+      const response = event.response;
+      const normalizedResponse = response ? { ...response, status: normalizeCodexStatus(response.status) } : response;
+      yield { ...event, type: "response.completed", response: normalizedResponse };
+      return;
+    }
+    yield event;
+  }
+}
+
+async function processStream(response: Response, output: AnyRecord, stream: ForwardingStream, model: AnyRecord) {
+  const { processResponsesStream } = (await import(openAIResponsesSharedUrl)) as AnyRecord;
+  await processResponsesStream(mapCodexEvents(parseSSE(response)), output, stream, model);
+}
+
+function createNewApiCodexStreamFn(pluginConfig: AnyRecord) {
+  return (model: AnyRecord, context: AnyRecord, options?: AnyRecord) => {
+    const stream = new ForwardingStream();
+    const nextContext = {
+      ...context,
+      systemPrompt: context?.systemPrompt || "You are a helpful assistant.",
+    };
+    queueMicrotask(async () => {
+      const output = {
+        role: "assistant",
+        content: [],
+        api: API_ID,
+        provider: PROVIDER_ID,
+        model: model?.id ?? "gpt-5.4",
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: "stop",
+        timestamp: Date.now(),
+      };
+      try {
+        const requestModel = {
+          ...model,
+          api: API_ID,
+          provider: PROVIDER_ID,
+          baseUrl: normalizeBaseUrl(model?.baseUrl ?? pluginConfig.baseUrl),
+        };
+        const apiKey = resolveApiKey(pluginConfig, options?.apiKey);
+        if (!apiKey) throw new Error(`No API key for provider: ${PROVIDER_ID}`);
+        let body = await buildRequestBody(requestModel, nextContext, options);
+        const nextBody = await options?.onPayload?.(body, requestModel);
+        if (nextBody !== undefined) body = nextBody;
+        const headers = new Headers({
+          ...(requestModel.headers || {}),
+          ...(options?.headers || {}),
+          Authorization: `Bearer ${apiKey}`,
+          Accept: "text/event-stream",
+          "Content-Type": "application/json",
+        });
+        if (options?.sessionId) {
+          headers.set("session_id", options.sessionId);
+          headers.set("x-client-request-id", options.sessionId);
+        }
+        const bodyJson = JSON.stringify(body);
+        let response: Response | undefined;
+        let lastError: Error | undefined;
+        for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+          if (options?.signal?.aborted) throw new Error("Request was aborted");
+          try {
+            response = await fetch(resolveResponsesUrl(requestModel.baseUrl), {
+              method: "POST",
+              headers,
+              body: bodyJson,
+              signal: options?.signal,
+            });
+            await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, requestModel);
+            if (response.ok) break;
+            const errorText = await response.text();
+            if (attempt < MAX_RETRIES && isRetryableError(response.status, errorText)) {
+              await sleep(BASE_DELAY_MS * 2 ** attempt, options?.signal);
+              continue;
+            }
+            throw new Error(await parseErrorResponse(new Response(errorText, { status: response.status, statusText: response.statusText })));
+          } catch (error) {
+            if (error instanceof Error && (error.name === "AbortError" || error.message === "Request was aborted")) {
+              throw new Error("Request was aborted");
+            }
+            lastError = error instanceof Error ? error : new Error(String(error));
+            if (attempt < MAX_RETRIES && !lastError.message.includes("usage limit")) {
+              await sleep(BASE_DELAY_MS * 2 ** attempt, options?.signal);
+              continue;
+            }
+            throw lastError;
+          }
+        }
+        if (!response?.ok) throw lastError ?? new Error("Failed after retries");
+        if (!response.body) throw new Error("No response body");
+        stream.push({ type: "start", partial: output });
+        await processStream(response, output, stream, requestModel);
+        if (options?.signal?.aborted) throw new Error("Request was aborted");
+        stream.push({ type: "done", reason: output.stopReason, message: output });
+        stream.end();
+      } catch (error) {
+        for (const block of output.content) delete block.partialJson;
+        output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+        (output as AnyRecord).errorMessage = error instanceof Error ? error.message : String(error);
+        stream.push({ type: "error", reason: output.stopReason, error: output });
+        stream.end();
+      }
+    });
+    return stream;
   };
 }
 
@@ -347,15 +403,34 @@ export default definePluginEntry({
           return { provider: buildProvider(pluginConfig, apiKey) };
         },
       },
-      resolveDynamicModel: (ctx: AnyRecord) => {
-        const id = String(ctx.modelId || "gpt-5.4");
-        return buildProvider(pluginConfig, pluginConfig.apiKey || "configured-by-runtime").models.find((model) => model.id === id) ??
-          buildProvider(pluginConfig, pluginConfig.apiKey || "configured-by-runtime").models[1];
+      resolveDynamicModel: (ctx: AnyRecord) => resolveDynamicModel(pluginConfig, String(ctx.modelId || "gpt-5.4")),
+      normalizeResolvedModel: (ctx: AnyRecord) => {
+        if (ctx.provider !== PROVIDER_ID) return;
+        return {
+          ...ctx.model,
+          api: API_ID,
+          provider: PROVIDER_ID,
+          baseUrl: normalizeBaseUrl(ctx.model?.baseUrl ?? pluginConfig.baseUrl),
+        };
       },
-      createStreamFn: () => createStreamFn(pluginConfig),
-      wrapStreamFn: (ctx: AnyRecord) => createStreamFn(pluginConfig, ctx),
-      isModernModelRef: () => true,
+      normalizeTransport: ({ provider, api, baseUrl }: AnyRecord) => {
+        if (provider !== PROVIDER_ID) return;
+        if (api === API_ID && baseUrl === normalizeBaseUrl(baseUrl ?? pluginConfig.baseUrl)) return;
+        return { api: API_ID, baseUrl: normalizeBaseUrl(baseUrl ?? pluginConfig.baseUrl) };
+      },
+      createStreamFn: () => createNewApiCodexStreamFn(pluginConfig),
       resolveReasoningOutputMode: () => "native",
+      resolveThinkingProfile: ({ modelId }: AnyRecord) => ({
+        levels: [
+          { id: "off" },
+          { id: "minimal" },
+          { id: "low" },
+          { id: "medium" },
+          { id: "high" },
+          ...(XHIGH_MODEL_IDS.has(String(modelId || "").trim()) ? [{ id: "xhigh" }] : []),
+        ],
+      }),
+      isModernModelRef: ({ modelId }: AnyRecord) => MODERN_MODEL_IDS.has(String(modelId || "").trim()),
     });
   },
 });

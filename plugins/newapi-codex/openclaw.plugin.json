@@ -5,9 +5,14 @@
   "providers": [
     "newapi-codex"
   ],
-  "providerAuthEnvVars": {
-    "newapi-codex": [
-      "NEWAPI_CODEX_API_KEY"
+  "setup": {
+    "providers": [
+      {
+        "id": "newapi-codex",
+        "envVars": [
+          "NEWAPI_CODEX_API_KEY"
+        ]
+      }
     ]
   },
   "configSchema": {
